@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# talc2 — local .internal domain manager
+# Requires: bash 5+, gum, caddy, dnsmasq, systemd-resolved, openssl, curl
+# shellcheck shell=bash
+set -euo pipefail
+
+TALC_VERSION='0.1.0'
+
+# ── source libs ───────────────────────────────────────────────────────────────
+_TALC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$_TALC_DIR/lib/ui.sh"
+source "$_TALC_DIR/lib/system.sh"
+source "$_TALC_DIR/lib/config.sh"
+source "$_TALC_DIR/lib/network.sh"
+source "$_TALC_DIR/lib/storage.sh"
+source "$_TALC_DIR/lib/dns.sh"
+source "$_TALC_DIR/lib/proxy.sh"
+source "$_TALC_DIR/lib/certs.sh"
+
+# ── global flags ──────────────────────────────────────────────────────────────
+VERBOSE=false
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+die() { ui::error "$*"; exit 1; }
+
+require_arg() {
+  local val="$1" name="$2"
+  [[ -n $val ]] || die "Missing required argument: $name"
+}
+
+validate_domain_name() {
+  local name="$1"
+  [[ $name =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || \
+    die "Invalid domain name '${name}'. Use letters, numbers, and hyphens only."
+}
+
+validate_port() {
+  local port="$1"
+  [[ $port =~ ^[0-9]+$ && $port -ge 1 && $port -le 65535 ]] || \
+    die "Invalid port '${port}'. Must be 1–65535."
+}
+
+resolve_ip() {
+  local ip="$1"
+  if [[ -z $ip || $ip == auto ]]; then
+    network::detect_local_ip
+  else
+    printf '%s' "$ip"
+  fi
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+cmd::setup() {
+  ui::header "talc2 setup"
+  printf '\n'
+
+  priv::detect
+
+  # Install packages
+  ui::info "Checking dependencies..."
+  pkg::install dnsmasq
+  pkg::install caddy
+
+  # Detect LAN IP
+  local local_ip
+  if [[ $TALC_LOCAL_IP == auto ]]; then
+    ui::info "Detecting LAN IP..."
+    local_ip="$(network::detect_local_ip)"
+    ui::success "Detected LAN IP: $local_ip"
+    TALC_LOCAL_IP="$local_ip"
+  else
+    local_ip="$TALC_LOCAL_IP"
+    ui::info "Using configured IP: $local_ip"
+  fi
+
+  # DNS configuration
+  ui::info "Configuring DNS..."
+  dns::configure "$local_ip" "$TALC_DOMAIN_SUFFIX"
+  ui::success "dnsmasq configured (port $DNSMASQ_PORT)"
+
+  # Enable + start dnsmasq
+  ui::spin "Enabling dnsmasq" -- priv::exec systemctl enable dnsmasq
+  dns::reload
+
+  # Enable + start Caddy
+  ui::spin "Enabling caddy" -- priv::exec systemctl enable caddy
+  if svc::running caddy; then
+    ui::info "caddy is already running"
+  else
+    ui::spin "Starting caddy" -- priv::exec systemctl start caddy
+  fi
+
+  # Save config
+  TALC_LOCAL_IP="$local_ip"
+  config::write
+  ui::success "Config written to $TALC_CONFIG_FILE"
+
+  printf '\n'
+  ui::success "Setup complete! Add domains with: talc add <name> --port <port>"
+}
+
+cmd::add() {
+  local name='' port='' ip=''
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --port|-p) port="$2"; shift 2 ;;
+      --ip|-i)   ip="$2";   shift 2 ;;
+      -*)        die "Unknown option: $1" ;;
+      *)         [[ -z $name ]] && name="$1" || die "Unexpected argument: $1"; shift ;;
+    esac
+  done
+
+  # Interactive mode when args are missing
+  if [[ -z $name ]]; then
+    name="$(ui::input "Domain name" "myapp")"
+  fi
+  if [[ -z $port ]]; then
+    port="$(ui::input "Local port" "3000")"
+  fi
+  [[ -z $ip ]] && ip=''
+
+  require_arg "$name" "DOMAIN"
+  require_arg "$port" "PORT"
+  validate_domain_name "$name"
+  validate_port "$port"
+
+  local resolved_ip; resolved_ip="$(resolve_ip "$ip")"
+  local full_domain="${name}.${TALC_DOMAIN_SUFFIX}"
+
+  if storage::exists "$name"; then
+    ui::confirm_danger "Domain '$name' already exists. Overwrite?" || { ui::info "Aborted."; return 0; }
+    storage::remove "$name"
+    proxy::remove_route "$full_domain" 2>/dev/null || true
+    [[ $TALC_ENABLE_TLS == true ]] && certs::remove "$full_domain" || true
+  fi
+
+  local cert_path='' key_path=''
+  if [[ $TALC_ENABLE_TLS == true ]]; then
+    ui::info "Generating TLS certificate..."
+    local cert_info
+    cert_info="$(certs::generate "$full_domain")"
+    cert_path="${cert_info%% *}"
+    key_path="${cert_info##* }"
+  fi
+
+  ui::info "Adding proxy route..."
+  proxy::add_route "$full_domain" "$port" "$resolved_ip" "$cert_path" "$key_path"
+  storage::add "$name" "$port" "$resolved_ip"
+
+  printf '\n'
+  ui::success "Added: $full_domain → $resolved_ip:$port"
+  [[ $TALC_ENABLE_TLS == true ]] && ui::info "TLS: $cert_path"
+}
+
+cmd::remove() {
+  local name="${1:-}"
+
+  if [[ -z $name ]]; then
+    # Pick from list
+    if _gum_available && [[ -n $(storage::all) ]]; then
+      name="$(storage::all | awk -F'\t' '{print $1}' | gum choose --header "Select domain to remove:")"
+    else
+      die "Usage: talc remove DOMAIN"
+    fi
+  fi
+
+  require_arg "$name" "DOMAIN"
+
+  storage::exists "$name" || die "Domain '$name' not found."
+
+  local full_domain="${name}.${TALC_DOMAIN_SUFFIX}"
+  ui::confirm_danger "Remove '$full_domain'?" || { ui::info "Aborted."; return 0; }
+
+  proxy::remove_route "$full_domain"
+  [[ $TALC_ENABLE_TLS == true ]] && certs::remove "$full_domain" || true
+  storage::remove "$name"
+
+  ui::success "Removed: $full_domain"
+}
+
+cmd::list() {
+  local format='table'
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --format|-f) format="$2"; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  local rows; rows="$(storage::all)"
+
+  if [[ -z $rows ]]; then
+    ui::info "No domains configured. Run: talc add <name> --port <port>"
+    return 0
+  fi
+
+  case "$format" in
+    json)
+      echo '['
+      local first=1
+      while IFS=$'\t' read -r name port ip updated; do
+        [[ $first == 1 ]] && first=0 || echo ','
+        printf '  {"name":"%s","port":%s,"ip":"%s","full_domain":"%s.%s","updated_at":"%s"}' \
+          "$name" "$port" "$ip" "$name" "$TALC_DOMAIN_SUFFIX" "$updated"
+      done <<< "$rows"
+      printf '\n]\n'
+      ;;
+    plain)
+      cat <<< "$rows"
+      ;;
+    table|*)
+      # Header row + data rows piped through gum table
+      {
+        printf 'NAME\tFULL DOMAIN\tPROXY\tUPDATED\n'
+        while IFS=$'\t' read -r name port ip updated; do
+          printf '%s\t%s.%s\t%s:%s\t%s\n' \
+            "$name" "$name" "$TALC_DOMAIN_SUFFIX" "$ip" "$port" "$updated"
+        done <<< "$rows"
+      } | ui::table
+      ;;
+  esac
+}
+
+cmd::update() {
+  local name='' new_port='' new_ip=''
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --port|-p) new_port="$2"; shift 2 ;;
+      --ip|-i)   new_ip="$2";   shift 2 ;;
+      -*)        die "Unknown option: $1" ;;
+      *)         [[ -z $name ]] && name="$1" || die "Unexpected argument: $1"; shift ;;
+    esac
+  done
+
+  [[ -z $name ]] && die "Usage: talc update DOMAIN [--port PORT] [--ip IP]"
+  storage::exists "$name" || die "Domain '$name' not found."
+
+  local row; row="$(storage::find "$name")"
+  local cur_port cur_ip
+  IFS=$'\t' read -r _ cur_port cur_ip _ <<< "$row"
+
+  # Interactive if no flags given
+  if [[ -z $new_port && -z $new_ip ]]; then
+    new_port="$(ui::input "Port" "$cur_port" "$cur_port")"
+    new_ip="$(ui::input "IP" "$cur_ip" "$cur_ip")"
+  fi
+
+  [[ -n $new_port ]] && validate_port "$new_port"
+
+  local full_domain="${name}.${TALC_DOMAIN_SUFFIX}"
+  local port="${new_port:-$cur_port}"
+  local ip="${new_ip:-$cur_ip}"
+
+  proxy::remove_route "$full_domain" 2>/dev/null || true
+
+  local cert_path='' key_path=''
+  if [[ $TALC_ENABLE_TLS == true ]]; then
+    certs::remove "$full_domain" 2>/dev/null || true
+    local cert_info
+    cert_info="$(certs::generate "$full_domain")"
+    cert_path="${cert_info%% *}"
+    key_path="${cert_info##* }"
+  fi
+
+  proxy::add_route "$full_domain" "$port" "$ip" "$cert_path" "$key_path"
+  storage::update "$name" "$port" "$ip"
+
+  ui::success "Updated: $full_domain → $ip:$port"
+}
+
+cmd::status() {
+  ui::header "talc2 status"
+  dns::status
+  proxy::status
+
+  printf '\n'
+  ui::header "Domains"
+  local count; count="$(storage::count)"
+  if (( count == 0 )); then
+    printf '\n'
+    ui::info "No domains configured."
+  else
+    printf '\n'
+    cmd::list
+  fi
+}
+
+cmd::teardown() {
+  local confirmed=false
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --confirm) confirmed=true; shift ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  if [[ $confirmed == false ]]; then
+    ui::confirm_danger "Remove ALL talc2 configuration and disable services?" || \
+      { ui::info "Aborted."; return 0; }
+  fi
+
+  ui::info "Removing proxy routes..."
+  while IFS=$'\t' read -r name _ _ _; do
+    proxy::remove_route "${name}.${TALC_DOMAIN_SUFFIX}" 2>/dev/null || true
+    [[ $TALC_ENABLE_TLS == true ]] && certs::remove "${name}.${TALC_DOMAIN_SUFFIX}" || true
+  done < <(storage::all)
+
+  storage::clear
+  proxy::teardown
+  dns::teardown
+
+  # Remove user config dir
+  rm -rf "$TALC_CONFIG_DIR"
+
+  ui::success "talc2 has been torn down."
+}
+
+cmd::version() {
+  printf 'talc2 %s\n' "$TALC_VERSION"
+}
+
+cmd::help() {
+  if _gum_available; then
+    gum style \
+      --border rounded \
+      --border-foreground 212 \
+      --padding "1 2" \
+      --width 60 \
+      "talc2 $TALC_VERSION — local .internal domains"
+  else
+    printf '\033[1;36mtalc2 %s\033[0m — local .internal domains\n\n' "$TALC_VERSION"
+  fi
+
+  cat <<'EOF'
+Usage:
+  talc <command> [options]
+
+Commands:
+  setup                    Install deps, configure DNS + proxy
+  add DOMAIN               Add a domain   (--port PORT, --ip IP)
+  remove DOMAIN            Remove a domain
+  list                     List domains   (--format table|json|plain)
+  update DOMAIN            Update a domain (--port PORT, --ip IP)
+  status                   Show system status
+  teardown                 Remove all talc2 config
+  version                  Print version
+
+Global flags:
+  --verbose, -v            Verbose error output
+  --help, -h               This help text
+
+EOF
+}
+
+# ── entrypoint ────────────────────────────────────────────────────────────────
+main() {
+  # Global flags before command
+  while (( $# > 0 )); do
+    case "$1" in
+      --verbose|-v) VERBOSE=true; shift ;;
+      --help|-h)    cmd::help; exit 0 ;;
+      --version)    cmd::version; exit 0 ;;
+      -*)           die "Unknown flag: $1" ;;
+      *)            break ;;
+    esac
+  done
+
+  local cmd="${1:-help}"; shift || true
+
+  # Load config (non-fatal if missing — setup creates it)
+  config::load 2>/dev/null || true
+
+  case "$cmd" in
+    setup)    cmd::setup    "$@" ;;
+    add)      cmd::add      "$@" ;;
+    remove|rm) cmd::remove  "$@" ;;
+    list|ls)  cmd::list     "$@" ;;
+    update)   cmd::update   "$@" ;;
+    status)   cmd::status   "$@" ;;
+    teardown) cmd::teardown "$@" ;;
+    version)  cmd::version  ;;
+    help|--help|-h) cmd::help ;;
+    *) die "Unknown command '${cmd}'. Run 'talc help'." ;;
+  esac
+}
+
+main "$@"
